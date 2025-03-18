@@ -1,14 +1,14 @@
-from fastapi import FastAPI, HTTPException, Depends, status, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, status, Request
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 import uvicorn
-import requests
+from typing import Dict, List
 
 # Конфигурация JWT
 SECRET_KEY = "your-secret-key"
@@ -29,7 +29,6 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True)
     hashed_password = Column(String)
-    ip_address = Column(String, nullable=True)  # Поле для хранения IP-адреса
 
 # Модель сообщения
 class Message(Base):
@@ -39,6 +38,7 @@ class Message(Base):
     receiver = Column(String, index=True)
     message = Column(Text)
     timestamp = Column(DateTime, default=datetime.utcnow)
+    is_delivered = Column(Boolean, default=False)  # Поле для отслеживания доставки
 
 # Создание таблиц в базе данных
 Base.metadata.create_all(bind=engine)
@@ -46,12 +46,8 @@ Base.metadata.create_all(bind=engine)
 # Инициализация FastAPI
 app = FastAPI(
     title="Локальный мессенджер",
-    description="API для локального мессенджера с использованием FastAPI и SQLAlchemy.",
+    description="API для локального мессенджера с использованием FastAPI и WebSocket. Подходит для разработки мобильных приложений.",
     version="1.0.0",
-    contact={
-        "name": "Поддержка",
-        "email": "support@example.com",
-    },
     license_info={
         "name": "MIT",
     },
@@ -130,6 +126,9 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
         raise credentials_exception
     return user
 
+# Хранение активных WebSocket-соединений
+active_connections: Dict[str, WebSocket] = {}
+
 # Эндпоинт для регистрации
 @app.post(
     "/register/",
@@ -155,7 +154,10 @@ async def register(user: UserRegister, db: Session = Depends(get_db)):
     summary="Авторизация",
     description="Авторизация пользователя и получение JWT токена.",
 )
-async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+async def login_for_access_token(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db)
+):
     user = authenticate_user(db, form_data.username, form_data.password)
     if not user:
         raise HTTPException(
@@ -163,64 +165,85 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
             detail="Неверное имя пользователя или пароль",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    
+    # Создаем токен
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
         data={"sub": user.username}, expires_delta=access_token_expires
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
-# Эндпоинт для установки IP-адреса
-@app.post(
-    "/set_ip/",
-    summary="Установка IP-адреса",
-    description="Установка IP-адреса клиента для получения сообщений.",
-)
-async def set_ip(request: Request, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    client_host = request.client.host  # Получаем IP-адрес клиента
-    current_user.ip_address = client_host
-    db.commit()
-    return {"status": "IP-адрес обновлен", "ip_address": client_host}
+# Эндпоинт для WebSocket-соединения
+@app.websocket("/ws/{username}")
+async def websocket_endpoint(websocket: WebSocket, username: str, db: Session = Depends(get_db)):
+    # Подключаем WebSocket
+    await websocket.accept()
+    
+    # Сохраняем соединение в словаре активных соединений
+    active_connections[username] = websocket
 
-# Эндпоинт для отправки сообщения через сервер
+    try:
+        while True:
+            # Ожидаем сообщения от клиента (если нужно)
+            data = await websocket.receive_text()
+            # Можно добавить логику обработки входящих сообщений
+    except WebSocketDisconnect:
+        # Удаляем соединение при отключении
+        del active_connections[username]
+
+# Эндпоинт для отправки сообщения через WebSocket
 @app.post(
     "/send_message/",
-    summary="Отправка сообщения через сервер",
-    description="Отправка сообщения другому пользователю через сервер.",
+    summary="Отправка сообщения через WebSocket",
+    description="Отправка сообщения другому пользователю через WebSocket.",
 )
 async def send_message(receiver_username: str, message: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     # Находим получателя в базе данных
     receiver = db.query(User).filter(User.username == receiver_username).first()
     if not receiver:
         raise HTTPException(status_code=404, detail="Получатель не найден")
-    if not receiver.ip_address:
-        raise HTTPException(status_code=404, detail="IP-адрес получателя не установлен")
 
     # Сохраняем сообщение в базе данных
     new_message = Message(sender=current_user.username, receiver=receiver.username, message=message)
     db.add(new_message)
     db.commit()
 
-    # Пересылаем сообщение на IP-адрес получателя
-    try:
-        response = requests.post(
-            f"http://{receiver.ip_address}:3456/receive_message/",
-            json={"sender": current_user.username, "message": message}
-        )
-        response.raise_for_status()
-    except requests.RequestException as e:
-        raise HTTPException(status_code=500, detail=f"Не удалось отправить сообщение: {str(e)}")
+    # Если получатель онлайн, отправляем сообщение через WebSocket
+    if receiver_username in active_connections:
+        receiver_websocket = active_connections[receiver_username]
+        try:
+            await receiver_websocket.send_text(f"{current_user.username}: {message}")
+            # Помечаем сообщение как доставленное
+            new_message.is_delivered = True
+            db.commit()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Не удалось отправить сообщение: {str(e)}")
 
-    return {"status": "Сообщение отправлено", "receiver": receiver.username, "ip_address": receiver.ip_address}
+    return {"status": "Сообщение отправлено", "receiver": receiver.username}
 
-# Эндпоинт для получения сообщений (для клиента)
-@app.post(
-    "/receive_message/",
-    summary="Получение сообщения",
-    description="Эндпоинт для получения сообщений от других пользователей.",
+# Эндпоинт для получения недоставленных сообщений
+@app.get(
+    "/get_undelivered_messages/",
+    summary="Получение недоставленных сообщений",
+    description="Возвращает все сообщения, которые не были доставлены пользователю, пока он был оффлайн.",
 )
-async def receive_message(sender: str, message: str):
-    # Здесь клиент может обработать входящее сообщение
-    return {"status": "Сообщение получено", "sender": sender, "message": message}
+async def get_undelivered_messages(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    # Находим все сообщения, адресованные текущему пользователю, которые не были доставлены
+    undelivered_messages = db.query(Message).filter(
+        Message.receiver == current_user.username,
+        Message.is_delivered == False
+    ).all()
+
+    # Помечаем сообщения как доставленные
+    for message in undelivered_messages:
+        message.is_delivered = True
+    db.commit()
+
+    # Возвращаем сообщения
+    return {"messages": [
+        {"sender": msg.sender, "message": msg.message, "timestamp": msg.timestamp}
+        for msg in undelivered_messages
+    ]}
 
 if __name__ == '__main__':
     uvicorn.run(app, host="192.168.1.168", port=3456)
